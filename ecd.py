@@ -24,6 +24,8 @@ from time import time, sleep
 from dsl import *
 from gpt import *
 
+# ■ ~
+
 class Deltas:
     def __init__(self, core):
         self.core = core
@@ -133,10 +135,7 @@ def makepaths(D, logits):
             continue
 
         for tidx, tailtype in enumerate(d.tailtypes):
-            if isinstance(logits, th.Tensor):
-                ps = logits.clone()
-            else:
-                ps = deepcopy(logits)
+            ps = logits.clone()
 
             # limit by type
             possibles = D.bytype[tailtype]
@@ -145,24 +144,19 @@ def makepaths(D, logits):
                 if idx not in possibles:
                     ps[idx] = -np.inf
 
-            Paths[d.idx].append(F.log_softmax(ps, -1))
+            ps = F.log_softmax(ps, -1).tolist()
+            Paths[d.idx].append(deepcopy(ps))
 
             # permit leafs
             possibles_terminal = D.bytype_terminal[tailtype]
-
-            if isinstance(logits, th.Tensor):
-                ps = logits.clone()
-            else:
-                ps = deepcopy(logits)
 
             for idx in range(len(ps)):
                 if idx not in possibles_terminal:
                     ps[idx] = -np.inf
 
-            Paths_terminal[d.idx].append(F.log_softmax(ps, -1))
+            Paths_terminal[d.idx].append(ps)
 
     return Paths, Paths_terminal
-
 
 def creategens(D, sources, paths, paths_terminal, maxdepth):
     if len(sources) == 0:
@@ -260,7 +254,98 @@ def denumerate(D, n, nlogp, paths, paths_terminal, maxdepth=10, verb=False):
         for gen, logp in zip(reversed(gens), np.cumsum(logps[::-1])):
             gen.logp = logp
 
-        yield nlogp + gens[0].logp, n
+        yield nlogp + gens[0].logp, deepcopy(n)
+
+
+def p2enumerate(n, nlogp, prebudget, budget, maxdepth=3):
+    if budget < 0 or isterminal(n):
+        yield nlogp, n
+        return
+
+    sources = paths[int(maxdepth <= 1)]
+    lsources, rsources = sources[n.idx]
+
+    for lidx, llogp in enumerate(lsources):
+        if budget + llogp < 0:
+            continue
+
+        for llogp, ltree in p2enumerate(D[lidx], llogp, prebudget + llogp, budget + llogp, maxdepth-1):
+            for ridx, rlogp in enumerate(rsources):
+                if budget + llogp + rlogp < 0:
+                    continue
+
+                for rlogp, rtree in p2enumerate(D[ridx], rlogp, prebudget + llogp + rlogp, budget + llogp + rlogp, maxdepth-1):
+
+                    if isterminal(D[ridx]) and prebudget > 0:
+                        continue
+
+                    n.tails = [ltree, rtree]
+
+                    yield llogp + rlogp, deepcopy(n)
+
+
+def cenumerate(D, Q, tp, budget, maxdepth, cb):
+    if budget[1] <= 0 or maxdepth < 0:
+        return True
+
+    for i in D.bytype[tp]:
+        if -Q[i] > budget[1]:
+            continue
+
+        d = D[i]
+        logp = Q[i]
+        nbudget = (budget[0] + logp, budget[1] + logp)
+
+        cenumerate_fold(D, Q, d, d.tailtypes, nbudget, logp, maxdepth - 1, cb)
+
+def cenumerate_fold(D, Q, d, tailtypes, budget, offset, maxdepth, cb):
+    if tailtypes is not None and len(tailtypes) > 0:
+        tailtp = tailtypes.pop(0)
+
+        def ccb(tail, tlogp):
+            nd = deepcopy(d)
+            if nd.tails is None:
+                nd.tails = []
+
+            nd.tails.append(tail)
+            nbudget = (budget[0] + tlogp, budget[1] + tlogp)
+            noffset = offset + tlogp
+
+            cenumerate_fold(D, Q, nd, deepcopy(tailtypes), nbudget, noffset, maxdepth, cb)
+
+        return cenumerate(D, Q, tailtp, (0, budget[1]), maxdepth, ccb)
+
+    if budget[0] < 0 and 0 <= budget[1]:
+        return cb(d, offset)
+
+    return True
+
+def groom(D, sources, alogp, budget, paths, maxdepth):
+    if len(sources) == 0:
+        yield alogp, []
+        return
+
+    source, *nextsources = sources
+
+    for idx, logp in enumerate(source):
+        if budget + logp < 0:
+            continue
+
+        for nlogp, tree in penumerate(D, D[idx], logp, budget + logp, paths, maxdepth-1):
+            for nnlogp, nntrees in groom(D, nextsources, alogp + nlogp, budget + nlogp, paths, maxdepth-1):
+                yield nnlogp, [tree] + nntrees
+
+
+def penumerate(D, n, nlogp, budget, paths, maxdepth=3):
+    if budget < 0 or isterminal(n):
+        yield nlogp, n
+        return
+
+    sources = paths[int(maxdepth <= 1)][n.idx]
+
+    for logp, args in groom(D, sources, nlogp, budget + nlogp, paths, maxdepth-1):
+        n.tails = args
+        yield logp, deepcopy(n)
 
 
 def expand(root: Delta, node: Delta, depth=0):
@@ -355,7 +440,7 @@ def newtree(D, type, paths, paths_terminal, depth=6, q=None):
 
     return tree
 
-def solve_needle(X, D, Q, solutions=None, depth=6, ntries=100_000):
+def solve_needle(X, D, Q, solutions=None, maxdepth=10, ntries=100_000):
     print(f'{len(D)=}')
 
     if solutions is None:
@@ -366,9 +451,10 @@ def solve_needle(X, D, Q, solutions=None, depth=6, ntries=100_000):
     notsolved = sum([s is None for s in solutions.values()])
 
     paths, paths_terminal = makepaths(D, Q)
+    requested_type = type(X[0])
 
     while True:
-        tree = newtree(D, type(X[0]), paths, paths_terminal, q=Q)
+        tree = newtree(D, requested_type, paths, paths_terminal, q=Q)
         try:
             out = tree()
         except TypeError:
@@ -394,7 +480,7 @@ def solve_needle(X, D, Q, solutions=None, depth=6, ntries=100_000):
     return solutions, notsolved
 
 
-def solve_enumeration(X, D, Q, solutions=None, maxdepth=6, ntries=100_000):
+def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60):
     print(f'{len(D)=}')
 
     if solutions is None:
@@ -405,23 +491,21 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=6, ntries=100_000):
     notsolved = sum([s is None for s in solutions.values()])
 
     requested_type = type(X[0][0])
-    # add an ephermal production
-    D = Deltas([Delta(None, None, [requested_type])] + D.ds)
-    Q = th.hstack((tensor([0]), Q))
+    print(f'{requested_type}')
 
-    ephermal = deepcopy(D[0])
-    paths, paths_terminal = makepaths(D, Q)
+    LOGPGAP = 2
+    done = False
 
-    for logp, tree in denumerate(D, ephermal, 0, paths, paths_terminal, maxdepth=maxdepth):
-        # unwrap ephermal root
-        tree = tree.tails[0]
-
-        try:
-            out = tree()
-        except TypeError:
-            print(f"what is this {tree=}?")
-
+    def cb(tree, logp):
+        nonlocal cnt, done, notsolved, stime
+        out = tree()
         cnt += 1
+
+        if not(cnt % 1000) and cnt > 0:
+            print(f'! {cnt/(time()-stime):.2f}/s')
+
+            if time() - stime > timeout:
+                done = True
 
         if out in X:
             if solutions[out] is None:
@@ -431,12 +515,16 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=6, ntries=100_000):
             if solutions[out] is None or length(tree) < length(solutions[out]):
                 solutions[out] = deepcopy(tree)
 
-        if cnt > ntries:
-            break
+            if notsolved == 0:
+                done = True
 
+    idx = 0
+    while not done:
+        cenumerate(D, Q, requested_type, (LOGPGAP * idx, LOGPGAP * (idx+1)), maxdepth, cb)
+        idx += 1
 
     took = time() - stime
-    print(f'total: {cnt}, took: {took:.0f}s, iter: {cnt/took:.0f}/s')
+    print(f'total: {cnt}, took: {took/60:.1f}m, iter: {cnt/took:.0f}/s')
     print(f'solved: {sum(s is not None for s in solutions.values())}/{len(solutions)}')
     return solutions, notsolved
 
@@ -466,7 +554,7 @@ def kcompress(D, trees):
         nd = None
 
         for d, c in most_common:
-            if c < 2:
+            if c < 3:
                 continue
 
             d = tr(d)
@@ -512,7 +600,6 @@ def dream(D, soltrees=[]):
     tbar = trange(100)
     for _ in tbar:
         trees = [newtree(D, str, paths, paths_terminal, depth=7) for _ in range(10)] + soltrees
-        print(trees)
 
         Xy = [[tree()[:ntoks], alld(tree)] for tree in trees]
 
@@ -534,17 +621,18 @@ def dream(D, soltrees=[]):
 
     return qmodel
 
-
-def ECD(X, D, ntries=1e6):
+def ECD(X, D, timeout=60):
     D.reset()
 
     sols = {x: None for x in X}
+    Q = th.ones(len(D))
     Q = th.arange(1, len(D)+1).float()
     Q = F.log_softmax(Q, -1)
 
     while True:
         # explore
-        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, ntries=ntries)
+        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
+        # sols, nunsolved = solve_needle(X, D, Q, sols, maxdepth=10, ntries=ntries)
 
         pprint(sols)
         trees = [s.balance() for s in sols.values() if s]
@@ -563,7 +651,7 @@ def ECD(X, D, ntries=1e6):
         Qmodel = dream(D, trees)
         Q = Qmodel(tc(X[0])[None]).flatten().detach()
         Q = F.log_softmax(Q, -1)
-
+        print(Q)
 
 if __name__ == '__main__':
     D = Deltas([
@@ -586,5 +674,5 @@ if __name__ == '__main__':
         "100010001000",
     ]
 
-    sols = ECD(X, D, ntries=10000)
+    sols = ECD(X, D, timeout=50)
     sols

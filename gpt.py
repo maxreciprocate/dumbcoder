@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import tensor, as_tensor, from_numpy
 from numpy.random import rand, randint, randn, normal
+import numpy as np
 
 
 class Attend(nn.Module):
@@ -133,6 +134,9 @@ def pprint(d: dict):
         print(f'{k}: {v}')
 
 def sample(ps):
+    if ps[0] < 0:
+        ps = np.exp(ps)
+
     ps /= ps.sum()
     cdf = ps.cumsum(-1)
     x = rand()
@@ -141,3 +145,14 @@ def sample(ps):
             return i
 
     return len(ps)-1
+
+def bar(ts, label=None):
+    if ts.requires_grad:
+        ts = ts.detach()
+
+    ts = ts.flatten()
+
+    if label is None:
+        label = np.arange(len(ts))
+
+    pyplot.bar(label[:len(ts)], ts)

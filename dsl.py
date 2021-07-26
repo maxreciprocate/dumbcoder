@@ -87,7 +87,7 @@ def getdepth(tree: Delta) -> int:
 
     out = 0
     for tail in tree.tails:
-        out = max(out, 1 + depth(tail))
+        out = max(out, 1 + getdepth(tail))
 
     return out
 
