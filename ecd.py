@@ -24,6 +24,8 @@ from time import time, sleep
 from dsl import *
 from gpt import *
 
+BREAK = " @ "
+
 # ■ ~
 
 class Deltas:
@@ -39,9 +41,7 @@ class Deltas:
             self.infer()
             return
 
-        out = d()
-
-        self.invented.append(Delta(out, type(out)))
+        self.invented.append(d)
         self.infer()
 
     def infer(self):
@@ -77,6 +77,10 @@ class Deltas:
         return chain(self.core + self.invented)
 
     def __getitem__(self, idx):
+        if isinstance(idx, str):
+            if (idx := self.index(idx)) is None:
+                return None
+
         # always careful, always on the watch
         return deepcopy(self.ds[idx])
 
@@ -100,10 +104,14 @@ class Deltas:
         return outd in od
 
 
-    def index(self, d):
-        for idx, _d in enumerate(self.ds):
-            if d.head == _d.head:
-                return idx
+    def index(self, d: Union[Delta, str]):
+        for idx, dd in enumerate(self.ds):
+            if isinstance(d, Delta):
+                if d.head == dd.head:
+                    return idx
+            else:
+                if d == dd.repr:
+                    return idx
 
         return None
 
@@ -498,10 +506,11 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60):
 
     def cb(tree, logp):
         nonlocal cnt, done, notsolved, stime
+
         out = tree()
         cnt += 1
 
-        if not(cnt % 1000) and cnt > 0:
+        if not(cnt % 10000) and cnt > 0:
             print(f'! {cnt/(time()-stime):.2f}/s')
 
             if time() - stime > timeout:
@@ -528,20 +537,6 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60):
     print(f'solved: {sum(s is not None for s in solutions.values())}/{len(solutions)}')
     return solutions, notsolved
 
-def replace(tree, oldbranch, newbranch):
-    "replace given subtree with a new one"
-    if isequal(tree, oldbranch):
-        tree = newbranch
-
-    if not tree.tails:
-        return
-
-    for idx in range(len(tree.tails)):
-        if isequal(tree.tails[idx], oldbranch):
-            tree.tails[idx] = newbranch
-
-        replace(tree.tails[idx], oldbranch, newbranch)
-
 
 def kcompress(D, trees):
     while True:
@@ -557,7 +552,7 @@ def kcompress(D, trees):
             if c < 3:
                 continue
 
-            d = tr(d)
+            d = tr(D, d)
 
             topkalon = totall - c * length(d) + c + length(d)
             if topkalon < mink:
@@ -576,6 +571,177 @@ def kcompress(D, trees):
 
         for tree in trees:
             replace(tree, nd, Delta(nd(), type(nd())))
+
+
+def truly_largest_substring(string):
+    for s1idx in range(len(string)):
+        if string[s1idx] != '(':
+            continue
+
+        for e1idx in range(s1idx+2, len(string)):
+            for s2idx in range(s1idx+1, len(string)):
+                if string[s2idx] != '(':
+                    continue
+
+                for e2idx in range(s2idx+2, len(string)):
+                    if BREAK in string[s1idx:e1idx]:
+                        continue
+
+                    if string[s1idx:e1idx] == string[s2idx:e2idx]:
+                        yield string[s1idx:e1idx]
+
+def findwrap(s, start):
+    i = start
+    nbrackets = 0
+    while i < len(s):
+        if s[i] == '(':
+            nbrackets += 1
+
+        if s[i] == ')':
+            nbrackets -= 1
+
+        if nbrackets == 0:
+            return i
+
+        i += 1
+
+
+def getit(D, string, prefix):
+    if prefix[-1] != ')':
+        prefix = prefix[:-prefix[::-1].find(' ')-1]
+
+    sidx = string.find(prefix)
+    idx = sidx
+
+    holeidx = 0
+    nbrackets = 0
+    mut = prefix
+    pastprefix = False
+
+    tailtypes = []
+
+    while idx < len(string):
+        if pastprefix and string[idx] not in "() ":
+            se_idx = idx
+            idx += 1
+
+            while string[idx].isalnum() or string[idx] == "'":
+                idx += 1
+
+            expr = string[se_idx:idx]
+            mut += f' ${holeidx}'
+            holeidx += 1
+
+            tailtypes.append(D[expr].type)
+
+        if string[idx] == BREAK:
+            break
+
+        if string[idx] == ')':
+            if pastprefix:
+                mut += ')'
+
+            nbrackets -= 1
+
+        if string[idx] == '(':
+            if pastprefix:
+                ending = findwrap(string, ast)
+                idx = tr(D, string[idx:ending+1])
+                tailtypes.append(ast.type)
+
+                mut += f' ${holeidx}'
+                holeidx += 1
+                idx = ending
+
+            else:
+                nbrackets += 1
+
+        if nbrackets == 0:
+            break
+
+        if idx >= sidx + len(prefix):
+            pastprefix = True
+
+        idx += 1
+
+    hiddentail = tr(D, mut)
+
+    if len(tailtypes) == 0:
+        name = hiddentail()
+        df = Delta(name, type=hiddentail.type, hiddentail=hiddentail)
+
+    else:
+        name = f"f{len(D.invented)}"
+        df = Delta(name, type=hiddentail.type, tailtypes=tailtypes, hiddentail=hiddentail, repr=f"{name} ({' '.join([f'${i}' for i in range(len(tailtypes))])}) {hiddentail}")
+
+    return df
+
+def count_occ(string, s):
+    c = 0
+    l = len(s)
+    for sidx in range(len(string)-l+1):
+        if string[sidx:sidx+l] == s:
+            c += 1
+
+    return c
+
+def seesvd(D, mx, string, s):
+    try:
+        nd = getit(D, string, s)
+    except:
+        print(f"can't do {s}")
+        return [np.inf]
+
+    c = count_occ(string, s)
+
+    _repr = len(s.split(' '))
+    if nd.tailtypes:
+        nrepr = 1 + len(nd.tailtypes)
+    else:
+        nrepr = 1
+
+    mxj = mx - c * (_repr - nrepr)
+    mj = length(nd.hiddentail)
+
+    k = (mxj + mj) / mx
+
+    return k, c, nd
+
+
+def AECD(X, D, timeout=60):
+    D.reset()
+
+    sols = {x: None for x in X}
+    nunsolved = len(sols)
+    Q = F.log_softmax(th.ones(len(D)), -1)
+
+    while nunsolved > 0:
+        print(f'{len(sols) - nunsolved}/{len(sols)}')
+        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
+
+        trees = [s.balance() for s in sols.values() if s]
+        mx = sum(map(length, trees))
+        string = BREAK.join(map(str, trees))
+
+        ss = sorted(set(truly_largest_substring(string)), key=len, reverse=True)
+        kd = sorted([seesvd(D, mx, string, s) for s in ss], key=lambda x:x[0])
+
+        k, c, nd = kd[0]
+        if not nd in D:
+            print(f'adding {nd} #{c} with {k:.2f}')
+            D.add(nd)
+
+        for tree in trees:
+            replace(tree, nd.hiddentail, nd)
+
+        if nunsolved == 0:
+            break
+
+        Qmodel = dream(D, trees)
+        Q = Qmodel(tc(X[0])[None]).flatten().detach()
+        Q = F.log_softmax(Q, -1)
+
+    return sols
 
 
 def tc(x):
@@ -655,13 +821,13 @@ def ECD(X, D, timeout=60):
 
 if __name__ == '__main__':
     D = Deltas([
-        Delta(add, int, [int, int]),
-        Delta(mul, str, [str, int]),
-        Delta(add, str, [str, str]),
+        Delta(add, int, [int, int], repr='+'),
+        Delta(mul, str, [str, int], repr='*'),
+        Delta(add, str, [str, str], repr='u'),
+        Delta('0', str, repr="'0'"),
+        Delta('1', str, repr="'1'"),
         Delta(3, int),
         Delta(2, int),
-        Delta('0', str),
-        Delta('1', str),
     ])
 
     X = [
@@ -674,5 +840,6 @@ if __name__ == '__main__':
         "100010001000",
     ]
 
-    sols = ECD(X, D, timeout=50)
+    sols = AECD(X, D, timeout=10)
+
     sols
