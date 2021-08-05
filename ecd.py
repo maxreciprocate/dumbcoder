@@ -24,8 +24,6 @@ from time import time, sleep
 from dsl import *
 from gpt import *
 
-BREAK = " @ "
-
 # ■ ~
 
 class Deltas:
@@ -36,12 +34,11 @@ class Deltas:
         self.infer()
 
     def add(self, d: Delta, terminal=True):
-        if not terminal:
-            self.invented.append(d)
-            self.infer()
-            return
-
         self.invented.append(d)
+        self.infer()
+
+    def pop(self, d: Delta):
+        self.invented.pop(self.index(d) - len(self.core))
         self.infer()
 
     def infer(self):
@@ -355,6 +352,129 @@ def penumerate(D, n, nlogp, budget, paths, maxdepth=3):
         n.tails = args
         yield logp, deepcopy(n)
 
+# ■ ~
+
+def sgroom(D, sources, alogp, budget, paths, maxdepth):
+    if len(sources) == 0:
+        yield alogp, []
+        return
+
+    source, *nextsources = sources
+
+    for idx, (logp, nz) in enumerate(source):
+        if logp == -np.inf:
+            continue
+
+        for nlogp, tree in spenumerate(D, D[idx], nz, logp, budget + logp, paths, maxdepth-1):
+            for nnlogp, nntrees in sgroom(D, nextsources, alogp + nlogp, budget + nlogp, paths, maxdepth-1):
+                yield nnlogp, [tree] + nntrees
+
+
+def spenumerate(D, n, nz, nlogp, budget, paths, maxdepth=3):
+    if budget < 0 or isterminal(n):
+        yield nlogp, n
+        return
+
+    sources = paths[nz]
+
+    for logp, args in sgroom(D, sources, nlogp, budget + nlogp, paths, maxdepth-1):
+        n.tails = args
+        yield logp, deepcopy(n)
+
+
+def marknodes(Q, tree):
+    z = 0
+    paths = []
+    qq = [tree]
+
+    while len(qq) > 0:
+        n = qq.pop(0)
+
+        if not n.tails:
+            paths.append([[]] * 2)
+        else:
+            sources = []
+            for tail in n.tails:
+                z += 1
+
+                # idx tells for the index in D,
+                # (q, z) for p of going and z where to
+                dtails = [(-np.inf, -1)] * len(D)
+                dtails[tail.idx] = (Q[tail.idx], z)
+                # bonus for the hole
+                dtails[D.index(dhole)] = (Q[D.index(dhole)], -1)
+                sources.append(dtails)
+
+                qq.append(tail)
+
+            paths.append(sources)
+
+    return paths
+
+def count_ghosts(tree, ghost):
+    if isequal(tree, ghost):
+        return 1
+
+    if not tree.tails:
+        return 0
+
+    return sum(map(lambda tail: count_ghosts(tail, ghost), tree.tails))
+
+dhole = Delta('<>', None)
+
+def saturate(D, sols):
+    trees = [normalize(deepcopy(s)) for s in sols.values() if s]
+
+    while True:
+        D.reset()
+        D.add(dhole)
+        Q = th.log_softmax(th.ones(len(D)), -1)
+        ghosts = flatten([list(spenumerate(D, D[D.index(tree.repr)], 0, 0, np.inf, marknodes(Q, tree), np.inf)) for tree in trees])
+        ghosts = [x[1] for x in ghosts]
+
+        ref = {}
+        for ghost in ghosts:
+            c = 0
+            for tree in trees:
+                c += count_ghosts(tree, ghost)
+
+            ref[ghost] = c
+
+        mx = sum(map(length, trees))
+
+        mk = 1
+        hiddentail = None
+
+        for ghost, c in ref.items():
+            nargs = 1 + countholes(ghost)
+
+            mxj = mx - c * (length(ghost) - nargs)
+            mj = length(ghost)
+
+            k = (mxj + mj) / mx
+            if k < mk:
+                print(f'{ghost} #{c} |{length(ghost)}|{nargs} {k:.2f}')
+                mk = k
+                hiddentail = ghost
+
+        D.pop(dhole)
+        if hiddentail == None:
+            return trees
+
+        tailtypes = typize(hiddentail)
+
+        if len(tailtypes) == 0:
+            name = hiddentail()
+            df = Delta(name, type=hiddentail.type, hiddentail=hiddentail)
+        else:
+            name = f"f{len(D.invented)}"
+            df = Delta(name, type=hiddentail.type, tailtypes=tailtypes, hiddentail=hiddentail, repr=name)
+
+        print(f"adding {df}")
+        D.add(df)
+
+        trees = [replace(tree, df.hiddentail, df) for tree in trees]
+
 
 def expand(root: Delta, node: Delta, depth=0):
     deltas = D.bytype_terminal if depth <= 1 else D.bytype
@@ -605,6 +725,7 @@ def findwrap(s, start):
 
         i += 1
 
+BREAK = " @ "
 
 def getit(D, string, prefix):
     if prefix[-1] != ')':
@@ -689,7 +810,6 @@ def seesvd(D, mx, string, s):
     try:
         nd = getit(D, string, s)
     except:
-        print(f"can't do {s}")
         return [np.inf]
 
     c = count_occ(string, s)
@@ -706,7 +826,6 @@ def seesvd(D, mx, string, s):
     k = (mxj + mj) / mx
 
     return k, c, nd
-
 
 def AECD(X, D, timeout=60):
     D.reset()
@@ -743,6 +862,28 @@ def AECD(X, D, timeout=60):
 
     return sols
 
+
+def SECD(X, D, timeout=60):
+    D.reset()
+
+    sols = {x: None for x in X}
+    nunsolved = len(sols)
+    Q = F.log_softmax(th.ones(len(D)), -1)
+
+    while nunsolved > 0:
+        print(f'{len(sols) - nunsolved}/{len(sols)}')
+        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
+
+        trees = saturate(D, sols)
+
+        if nunsolved == 0:
+            break
+
+        Qmodel = dream(D, trees)
+        Q = Qmodel(tc(X[0])[None]).flatten().detach()
+        Q = F.log_softmax(Q, -1)
+
+    return {x: tree for x, tree in zip(sols, trees)}
 
 def tc(x):
     return tensor([int(c) for c in x])
@@ -840,6 +981,6 @@ if __name__ == '__main__':
         "100010001000",
     ]
 
-    sols = AECD(X, D, timeout=10)
+    sols = SECD(X, D, timeout=10)
 
     sols

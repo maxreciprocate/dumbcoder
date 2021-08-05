@@ -30,7 +30,7 @@ class Delta:
             body = deepcopy(self.hiddentail)
 
             for tidx, tail in enumerate(self.tails):
-                replace(body, Delta(f'${tidx}'), tail)
+                replace(body, Delta(f'${tidx}', '$'), tail)
 
             return body()
 
@@ -42,8 +42,6 @@ class Delta:
                 tails.append(a)
 
         return self.head(*tails)
-
-
 
     def balance(self):
         if not self.tails:
@@ -89,14 +87,23 @@ def length(tree: Delta) -> int:
     if not tree:
         return 0
 
-    if not tree.tails or len(tree.tails) == 0:
+    if not tree.tails:
         return 1
 
-    out = 1
-    for tail in tree.tails:
-        out += length(tail)
+    return 1 + sum(map(length, tree.tails))
 
-    return out
+def countholes(tree: Delta) -> int:
+    if not tree:
+        return 0
+
+    if not tree.type:
+        return 1
+
+    if not tree.tails:
+        return 0
+
+    return sum(map(countholes, tree.tails))
+
 
 
 def getdepth(tree: Delta) -> int:
@@ -194,33 +201,96 @@ def todelta(D, ast):
 def tr(D, expr):
     return todelta(D, getast(expr))
 
-# ■ ~
-
 def isequal(n1, n2):
+    # wildcard matches everything
+    if not n1.type or not n2.type:
+        return True
+
     if n1.head == n2.head:
+        # 26 no kids
         if not n1.tails and not n2.tails:
             return True
 
         if not n1.tails or not n2.tails:
             return False
 
-        return isequal(n1.tails[0], n2.tails[0]) and isequal(n1.tails[1], n2.tails[1])
-    return False
+        return all(map(lambda ts: isequal(*ts), zip(n1.tails, n2.tails)))
 
+    return False
 
 def replace(tree, oldbranch, newbranch):
     "replace given subtree with a new one"
     if isequal(tree, oldbranch):
-        tree = newbranch
+        return newbranch
 
     if not tree.tails:
         return
 
-    for idx in range(len(tree.tails)):
-        if isequal(tree.tails[idx], oldbranch):
-            tree.tails[idx] = newbranch
+    qq = [tree]
+    while len(qq) > 0:
+        n = qq.pop(0)
 
-        replace(tree.tails[idx], oldbranch, newbranch)
+        if not n.tails:
+            continue
+
+        for idx in range(len(n.tails)):
+            if isequal(tree.tails[idx], oldbranch):
+                n.tails[idx] = newbranch
+            else:
+                qq.append(n.tails[idx])
+
+    return tree
+
+
+def normalize(tree):
+    if tree.hiddentail:
+        if not tree.tails:
+            return tree.hiddentail
+
+    qq = [tree]
+    while len(qq) > 0:
+        n = qq.pop(0)
+
+        if not n.tails:
+            continue
+
+        for idx in range(len(n.tails)):
+            if n.tails[idx].hiddentail:
+                tails = n.tails[idx].tails
+                n.tails[idx] = n.tails[idx].hiddentail
+
+                if not tails:
+                    continue
+
+                for tidx, tt in enumerate(tails):
+                    tt = normalize(tt)
+                    replace(n.tails[idx], Delta(f'${tidx}'), tt)
+
+    return tree
+
+
+# not reentrant
+def typize(tree: Delta):
+    "replace each hole with $arg, returning all $arg's types"
+    qq = [tree]
+    tailtypes = []
+    z = 0
+
+    while len(qq) > 0:
+        n = qq.pop(0)
+
+        if not n.tails:
+            continue
+
+        for idx, tp in enumerate(n.tailtypes):
+            if not n.tails[idx].type:
+                tailtypes.append(tp)
+                n.tails[idx] = Delta('$' + str(z), tp)
+                z += 1
+            else:
+                qq.append(n.tails[idx])
+
+    return tailtypes
 
 
 def comp(n1, n2):
