@@ -104,7 +104,7 @@ class Deltas:
     def index(self, d: Union[Delta, str]):
         for idx, dd in enumerate(self.ds):
             if isinstance(d, Delta):
-                if d.head == dd.head:
+                if d.repr == dd.repr:
                     return idx
             else:
                 if d == dd.repr:
@@ -352,8 +352,6 @@ def penumerate(D, n, nlogp, budget, paths, maxdepth=3):
         n.tails = args
         yield logp, deepcopy(n)
 
-# ■ ~
-
 def sgroom(D, sources, alogp, budget, paths, maxdepth):
     if len(sources) == 0:
         yield alogp, []
@@ -381,8 +379,7 @@ def spenumerate(D, n, nz, nlogp, budget, paths, maxdepth=3):
         n.tails = args
         yield logp, deepcopy(n)
 
-
-def marknodes(Q, tree):
+def marknodes(D, Q, tree):
     z = 0
     paths = []
     qq = [tree]
@@ -400,7 +397,7 @@ def marknodes(Q, tree):
                 # idx tells for the index in D,
                 # (q, z) for p of going and z where to
                 dtails = [(-np.inf, -1)] * len(D)
-                dtails[tail.idx] = (Q[tail.idx], z)
+                dtails[tail.idx] = (Q[D.index(tail)], z)
                 # bonus for the hole
                 dtails[D.index(dhole)] = (Q[D.index(dhole)], -1)
                 sources.append(dtails)
@@ -423,13 +420,18 @@ def count_ghosts(tree, ghost):
 dhole = Delta('<>', None)
 
 def saturate(D, sols):
-    trees = [normalize(deepcopy(s)) for s in sols.values() if s]
+    trees = [normalize(s) for s in sols.values() if s]
+    for t in trees:
+        print(f'{t}, {D.index(t)=}')
+
+    D.reset()
+    print(D)
 
     while True:
-        D.reset()
         D.add(dhole)
         Q = th.log_softmax(th.ones(len(D)), -1)
-        ghosts = flatten([list(spenumerate(D, D[D.index(tree.repr)], 0, 0, np.inf, marknodes(Q, tree), np.inf)) for tree in trees])
+
+        ghosts = flatten([list(spenumerate(D, D[D.index(tree)], 0, 0, np.inf, marknodes(D, Q, tree), np.inf)) for tree in trees])
         ghosts = [x[1] for x in ghosts]
 
         ref = {}
@@ -455,7 +457,7 @@ def saturate(D, sols):
             if k < mk:
                 print(f'{ghost} #{c} |{length(ghost)}|{nargs} {k:.2f}')
                 mk = k
-                hiddentail = ghost
+                hiddentail = deepcopy(ghost)
 
         D.pop(dhole)
         if hiddentail == None:
@@ -465,15 +467,21 @@ def saturate(D, sols):
 
         if len(tailtypes) == 0:
             name = hiddentail()
-            df = Delta(name, type=hiddentail.type, hiddentail=hiddentail)
+            df = Delta(name, type=hiddentail.type, hiddentail=hiddentail, repr=name)
         else:
             name = f"f{len(D.invented)}"
             df = Delta(name, type=hiddentail.type, tailtypes=tailtypes, hiddentail=hiddentail, repr=name)
 
-        print(f"adding {df}")
-        D.add(df)
+        print(f"adding {df}: {df.type} with {df.hiddentail}")
+
 
         trees = [replace(tree, df.hiddentail, df) for tree in trees]
+
+        for tree in trees:
+            freeze(tree)
+
+        freeze(df)
+        D.add(df)
 
 
 def expand(root: Delta, node: Delta, depth=0):
@@ -581,6 +589,13 @@ def solve_needle(X, D, Q, solutions=None, maxdepth=10, ntries=100_000):
     paths, paths_terminal = makepaths(D, Q)
     requested_type = type(X[0])
 
+    ephermal = Delta(None, None, tailtypes=[requested_type])
+    D.add(ephermal)
+    for wrapper in penumerate(D, ephermal, 0, 10, *makepaths(D, Q), maxdepth=maxdepth+1):
+        tree = wrapper.tails[0]
+        out = tree()
+
+
     while True:
         tree = newtree(D, requested_type, paths, paths_terminal, q=Q)
         try:
@@ -608,7 +623,7 @@ def solve_needle(X, D, Q, solutions=None, maxdepth=10, ntries=100_000):
     return solutions, notsolved
 
 
-def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60):
+def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60, budget=0):
     print(f'{len(D)=}')
 
     if solutions is None:
@@ -628,6 +643,7 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60):
         nonlocal cnt, done, notsolved, stime
 
         out = tree()
+
         cnt += 1
 
         if not(cnt % 10000) and cnt > 0:
@@ -647,10 +663,21 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60):
             if notsolved == 0:
                 done = True
 
-    idx = 0
-    while not done:
-        cenumerate(D, Q, requested_type, (LOGPGAP * idx, LOGPGAP * (idx+1)), maxdepth, cb)
-        idx += 1
+    if budget == 0:
+        idx = 0
+        while not done:
+            cenumerate(D, Q, requested_type, (LOGPGAP * idx, LOGPGAP * (idx+1)), maxdepth, cb)
+            idx += 1
+    else:
+        ephermal = Delta(None, None, tailtypes=[requested_type])
+        D.add(ephermal)
+        Q = th.hstack((Q, tensor([0])))
+
+        for logp, wrapper in penumerate(D, ephermal, 0, budget, makepaths(D, Q), maxdepth=maxdepth+1):
+            tree = wrapper.tails[0]
+            cb(tree, logp)
+
+        D.pop(ephermal)
 
     took = time() - stime
     print(f'total: {cnt}, took: {took/60:.1f}m, iter: {cnt/took:.0f}/s')
@@ -836,6 +863,7 @@ def AECD(X, D, timeout=60):
 
     while nunsolved > 0:
         print(f'{len(sols) - nunsolved}/{len(sols)}')
+
         sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
 
         trees = [s.balance() for s in sols.values() if s]
@@ -863,18 +891,21 @@ def AECD(X, D, timeout=60):
     return sols
 
 
-def SECD(X, D, timeout=60):
+def SECD(X, D, timeout=60, budget=0):
     D.reset()
 
     sols = {x: None for x in X}
     nunsolved = len(sols)
     Q = F.log_softmax(th.ones(len(D)), -1)
 
+    idx = 0
     while nunsolved > 0:
+        Q = F.log_softmax(th.ones(len(D)), -1)
         print(f'{len(sols) - nunsolved}/{len(sols)}')
-        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
+        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout, budget=budget + 2 * idx)
 
         trees = saturate(D, sols)
+        idx += 1
 
         if nunsolved == 0:
             break
@@ -981,6 +1012,6 @@ if __name__ == '__main__':
         "100010001000",
     ]
 
-    sols = SECD(X, D, timeout=10)
+    sols = SECD(X, D, budget=20)
 
     sols

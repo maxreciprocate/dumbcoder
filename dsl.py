@@ -30,7 +30,7 @@ class Delta:
             body = deepcopy(self.hiddentail)
 
             for tidx, tail in enumerate(self.tails):
-                replace(body, Delta(f'${tidx}', '$'), tail)
+                replace(body, Delta(f'${tidx}', '-'), tail)
 
             return body()
 
@@ -206,6 +206,10 @@ def isequal(n1, n2):
     if not n1.type or not n2.type:
         return True
 
+    # or a wildcard of type $arg
+    if n1.type == '$' or n2.type == '$':
+        return True
+
     if n1.head == n2.head:
         # 26 no kids
         if not n1.tails and not n2.tails:
@@ -218,10 +222,40 @@ def isequal(n1, n2):
 
     return False
 
+def extract_matches(tree, treeholed):
+    """
+    given a healthy tree, find in it part covering holes in a given treeholed
+    return pairs of holes and covered parts
+    """
+    if not tree:
+        return []
+
+    if treeholed.type == '$':
+        return [(treeholed.head, tree)]
+
+    out = []
+    if not tree.tails:
+        return []
+
+    for tail, holedtail in zip(tree.tails, treeholed.tails):
+        out += extract_matches(tail, holedtail)
+
+    return out
+
+
 def replace(tree, oldbranch, newbranch):
     "replace given subtree with a new one"
     if isequal(tree, oldbranch):
-        return newbranch
+        if not tree.tails:
+            return deepcopy(newbranch)
+
+        # in other words, if this is an abstraction
+        if newbranch.tailtypes and newbranch.hiddentail:
+            branch = deepcopy(newbranch)
+            args = {arg: tail for arg, tail in extract_matches(tree, oldbranch)}
+            if len(args) > 0:
+                branch.tails = list(args.values())
+            return branch
 
     if not tree.tails:
         return
@@ -234,18 +268,42 @@ def replace(tree, oldbranch, newbranch):
             continue
 
         for idx in range(len(n.tails)):
-            if isequal(tree.tails[idx], oldbranch):
-                n.tails[idx] = newbranch
+            if isequal(n.tails[idx], oldbranch):
+                branch = deepcopy(newbranch)
+                args = {arg: tail for arg, tail in extract_matches(n.tails[idx], oldbranch)}
+                if len(args) > 0:
+                    branch.tails = list(args.values())
+
+                n.tails[idx] = branch
+
             else:
                 qq.append(n.tails[idx])
 
     return tree
 
+# d.type $ has property of wildcard matching
+# making it impossible to modify hiddentails
+def freeze(tree: Delta):
+    if tree.type == '$':
+        tree.type = '-'
+
+    if tree.hiddentail:
+        freeze(tree.hiddentail)
+
+    if tree.tails:
+        for tail in tree.tails:
+            freeze(tail)
+
 
 def normalize(tree):
     if tree.hiddentail:
-        if not tree.tails:
-            return tree.hiddentail
+        ht = normalize(deepcopy(tree.hiddentail))
+
+        if tree.tails:
+            for tidx, tail in enumerate(tree.tails):
+                replace(ht, Delta(f'${tidx}', '-'), normalize(tail))
+
+        return ht
 
     qq = [tree]
     while len(qq) > 0:
@@ -257,14 +315,15 @@ def normalize(tree):
         for idx in range(len(n.tails)):
             if n.tails[idx].hiddentail:
                 tails = n.tails[idx].tails
-                n.tails[idx] = n.tails[idx].hiddentail
+                n.tails[idx] = normalize(deepcopy(n.tails[idx].hiddentail))
 
                 if not tails:
                     continue
 
-                for tidx, tt in enumerate(tails):
-                    tt = normalize(tt)
-                    replace(n.tails[idx], Delta(f'${tidx}'), tt)
+                for tidx, tail in enumerate(tails):
+                    replace(n.tails[idx], Delta(f'${tidx}', '-'), normalize(tail))
+            else:
+                qq.append(normalize(n.tails[idx]))
 
     return tree
 
@@ -283,9 +342,10 @@ def typize(tree: Delta):
             continue
 
         for idx, tp in enumerate(n.tailtypes):
-            if not n.tails[idx].type:
+            # len(n.tails) < len(n.tailtypes) greedy match eg (* <>)
+            if idx >= len(n.tails) or not n.tails[idx].type:
                 tailtypes.append(tp)
-                n.tails[idx] = Delta('$' + str(z), tp)
+                n.tails[idx] = Delta('$' + str(z), '$')
                 z += 1
             else:
                 qq.append(n.tails[idx])
