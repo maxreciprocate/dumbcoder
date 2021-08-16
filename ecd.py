@@ -7,6 +7,8 @@ from numpy import zeros, ones, empty, array
 from collections import Counter, defaultdict, namedtuple
 from dataclasses import dataclass
 
+from itertools import product, repeat
+
 from typing import Optional, Union, List, NamedTuple
 
 import torch as th
@@ -17,12 +19,18 @@ from torch import tensor, as_tensor, from_numpy
 from itertools import chain
 from functools import partial, reduce, lru_cache
 
+import pickle
 from tqdm import tqdm, trange
 from copy import deepcopy
 from time import time, sleep
 
 from dsl import *
 from gpt import *
+
+import os
+
+ncores = os.cpu_count() // 2
+import multiprocessing as mp
 
 # ■ ~
 
@@ -104,7 +112,7 @@ class Deltas:
     def index(self, d: Union[Delta, str]):
         for idx, dd in enumerate(self.ds):
             if isinstance(d, Delta):
-                if d.repr == dd.repr:
+                if d.head == dd.head and d.type == dd.type:
                     return idx
             else:
                 if d == dd.repr:
@@ -115,6 +123,7 @@ class Deltas:
     def reset(self):
         self.invented = []
         self.infer()
+
 
 @dataclass
 class Gen:
@@ -131,7 +140,7 @@ class Gen:
         return f"({self.logp:.2f}/{self.branch_logp:.2f}) [{' '.join(ap(str, self.next_generators))}]"
 
 
-def makepaths(D, logits):
+def makepaths(D, Q):
     Paths = [[] for i in range(len(D))]
     Paths_terminal = [[] for i in range(len(D))]
 
@@ -140,11 +149,10 @@ def makepaths(D, logits):
             continue
 
         for tidx, tailtype in enumerate(d.tailtypes):
-            ps = logits.clone()
+            ps = Q.clone()
 
             # limit by type
             possibles = D.bytype[tailtype]
-
             for idx in range(len(ps)):
                 if idx not in possibles:
                     ps[idx] = -np.inf
@@ -396,10 +404,18 @@ def marknodes(D, Q, tree):
 
                 # idx tells for the index in D,
                 # (q, z) for p of going and z where to
+                # -1 means no entry for z
                 dtails = [(-np.inf, -1)] * len(D)
-                dtails[tail.idx] = (Q[D.index(tail)], z)
+
+                if not D.index(tail) is None:
+                    dtails[tail.idx] = (Q[D.index(tail)], z)
+                else:
+                    print(f'big mistake - {tail}:{tail.type} is not in {D}')
+
                 # bonus for the hole
-                dtails[D.index(dhole)] = (Q[D.index(dhole)], -1)
+                arrowidx = D.index(Delta('<>', ishole=True, type=tail.type))
+                dtails[arrowidx] = (0, -1)
+
                 sources.append(dtails)
 
                 qq.append(tail)
@@ -415,39 +431,116 @@ def count_ghosts(tree, ghost):
     if not tree.tails:
         return 0
 
-    return sum(map(lambda tail: count_ghosts(tail, ghost), tree.tails))
+    out = 0
+    for tail in tree.tails:
+        out += count_ghosts(tail, ghost)
 
-dhole = Delta('<>', None)
+    return out
 
-def saturate(D, sols):
-    trees = [normalize(s) for s in sols.values() if s]
-    for t in trees:
-        print(f'{t}, {D.index(t)=}')
 
-    D.reset()
-    print(D)
+def chill_count(tree, ghosts):
+    count = Counter()
+    qq = [tree]
 
-    while True:
-        D.add(dhole)
-        Q = th.log_softmax(th.ones(len(D)), -1)
+    while len(qq) > 0:
+        n = qq.pop(0)
 
-        ghosts = flatten([list(spenumerate(D, D[D.index(tree)], 0, 0, np.inf, marknodes(D, Q, tree), np.inf)) for tree in trees])
-        ghosts = [x[1] for x in ghosts]
-
-        ref = {}
         for ghost in ghosts:
+            if isequal(n, ghost):
+                count[ghost] += 1
+
+        if not n.tails: continue
+        for tail in n.tails:
+            qq.append(tail)
+
+    return count
+
+
+def count_simply(trees, ghosts):
+    count = Counter()
+
+    for ghost in ghosts:
+        for tree in trees:
+            count[ghost] += count_ghosts(tree, ghost)
+
+    return count
+
+
+def count_jive(D, Q, alltrees, trees):
+    count = Counter()
+
+    for tree in trees:
+        for _, ghost in spenumerate(D, D[D.index(tree)], 0, 0, np.inf, marknodes(D, Q, tree), np.inf):
             c = 0
-            for tree in trees:
+            for tree in alltrees:
                 c += count_ghosts(tree, ghost)
 
-            ref[ghost] = c
+            count[ghost] = c
+
+    return count
+
+
+def ghostsout(D, Q, trees):
+    ghosts = set()
+    for tree in trees:
+        for _, ghost in spenumerate(D, D[D.index(tree)], 0, 0, np.inf, marknodes(D, Q, tree), np.inf):
+            ghosts.add(ghost)
+
+    return ghosts
+
+
+def split(ncores, xs):
+    l = len(xs) // ncores
+
+    splitted = []
+    for i in range(ncores+1):
+        splitted.append(xs[i*l:min(len(xs),(i+1)*l)])
+    splitted[-2].extend(splitted[-1])
+    splitted.pop(-1)
+
+    return splitted
+
+
+def saturate(D, sols):
+    ghosttime = time()
+    trees = [normalize(s) for s in sols.values() if s]
+
+    D.reset()
+
+    print(f"size of the forest: {len(pickle.dumps(trees)) >> 10}M")
+
+    while True:
+        types = reduce(lambda acc, x: acc | x, [showoff_types(tree) for tree in trees])
+
+        for tp in types:
+            D.add(Delta('<>', ishole=True, type=tp))
+
+        Q = th.log_softmax(th.ones(len(D)), -1)
+
+        stime = time()
+
+        splitted_trees = split(ncores, trees)
+
+        if ncores > 1:
+            try:
+                pool = mp.Pool(ncores)
+                counts = pool.starmap(count_jive, zip(repeat(D), repeat(Q), repeat(trees), splitted_trees))
+            finally:
+                pool.close()
+                pool.join()
+
+            counts = sum(counts, Counter())
+        else:
+            counts = count_jive(D, Q, trees, trees)
+
+        print(f'counted those fellows in {(time() - stime) / 60:.2f}m')
 
         mx = sum(map(length, trees))
 
-        mk = 1
+        mk = 0.99
         hiddentail = None
 
-        for ghost, c in ref.items():
+        for ghost, c in counts.items():
             nargs = 1 + countholes(ghost)
 
             mxj = mx - c * (length(ghost) - nargs)
@@ -455,25 +548,26 @@ def saturate(D, sols):
 
             k = (mxj + mj) / mx
             if k < mk:
-                print(f'{ghost} #{c} |{length(ghost)}|{nargs} {k:.2f}')
                 mk = k
                 hiddentail = deepcopy(ghost)
 
-        D.pop(dhole)
+        for dhole in D[D.index('<>'):]:
+            D.pop(dhole)
+
         if hiddentail == None:
+            print(f'ghosting took {(time() - ghosttime)/60:.2f}m')
             return trees
 
         tailtypes = typize(hiddentail)
 
         if len(tailtypes) == 0:
             name = hiddentail()
-            df = Delta(name, type=hiddentail.type, hiddentail=hiddentail, repr=name)
+            df = Delta(name, type=hiddentail.type, hiddentail=hiddentail, repr=f"'{name}'")
         else:
             name = f"f{len(D.invented)}"
             df = Delta(name, type=hiddentail.type, tailtypes=tailtypes, hiddentail=hiddentail, repr=name)
 
-        print(f"adding {df}: {df.type} with {df.hiddentail}")
-
+        print(f"adding {df}: {df.type} with {df.hiddentail} #{mk:.3f}")
 
         trees = [replace(tree, df.hiddentail, df) for tree in trees]
 
@@ -482,7 +576,6 @@ def saturate(D, sols):
 
         freeze(df)
         D.add(df)
-
 
 def expand(root: Delta, node: Delta, depth=0):
     deltas = D.bytype_terminal if depth <= 1 else D.bytype
@@ -591,10 +684,10 @@ def solve_needle(X, D, Q, solutions=None, maxdepth=10, ntries=100_000):
 
     ephermal = Delta(None, None, tailtypes=[requested_type])
     D.add(ephermal)
+
     for wrapper in penumerate(D, ephermal, 0, 10, *makepaths(D, Q), maxdepth=maxdepth+1):
         tree = wrapper.tails[0]
         out = tree()
-
 
     while True:
         tree = newtree(D, requested_type, paths, paths_terminal, q=Q)
@@ -626,42 +719,42 @@ def solve_needle(X, D, Q, solutions=None, maxdepth=10, ntries=100_000):
 def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60, budget=0):
     print(f'{len(D)=}')
 
-    if solutions is None:
-        solutions = {x: None for x in X}
-
+    tosolve = count_everyone(X)
     cnt = 0
     stime = time()
-    notsolved = sum([s is None for s in solutions.values()])
 
-    requested_type = type(X[0][0])
-    print(f'{requested_type}')
+    requested_type = type(X)
+    print(f"{requested_type=}")
 
     LOGPGAP = 2
     done = False
 
     def cb(tree, logp):
-        nonlocal cnt, done, notsolved, stime
+        nonlocal cnt, done, stime
 
-        out = tree()
+        try:
+            out = tree()
+        except Exception as e:
+            print(f"it's just a little mistake: {e} with {tree}")
+            return
+
+        if out == X:
+            done = True
 
         cnt += 1
 
-        if not(cnt % 10000) and cnt > 0:
+        if not(cnt % 100000) and cnt > 0:
             print(f'! {cnt/(time()-stime):.2f}/s')
 
             if time() - stime > timeout:
                 done = True
 
         if out in X:
-            if solutions[out] is None:
-                notsolved -= 1
-                print(f'[{cnt:6d}] caught {out}')
+            if not out in solutions:
+                print(f'[{cnt:6d}] caught {out} with {tree}')
 
-            if solutions[out] is None or length(tree) < length(solutions[out]):
+            if not out in solutions or length(tree) < length(solutions[out]):
                 solutions[out] = deepcopy(tree)
-
-            if notsolved == 0:
-                done = True
 
     if budget == 0:
         idx = 0
@@ -669,7 +762,7 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60, budget=0
             cenumerate(D, Q, requested_type, (LOGPGAP * idx, LOGPGAP * (idx+1)), maxdepth, cb)
             idx += 1
     else:
-        ephermal = Delta(None, None, tailtypes=[requested_type])
+        ephermal = Delta('root', ishole=True, tailtypes=[requested_type])
         D.add(ephermal)
         Q = th.hstack((Q, tensor([0])))
 
@@ -681,8 +774,8 @@ def solve_enumeration(X, D, Q, solutions=None, maxdepth=10, timeout=60, budget=0
 
     took = time() - stime
     print(f'total: {cnt}, took: {took/60:.1f}m, iter: {cnt/took:.0f}/s')
-    print(f'solved: {sum(s is not None for s in solutions.values())}/{len(solutions)}')
-    return solutions, notsolved
+    print(f'solved: {sum(s is not None for s in solutions.values())}/{tosolve}')
+    return solutions
 
 
 def kcompress(D, trees):
@@ -833,6 +926,7 @@ def count_occ(string, s):
 
     return c
 
+
 def seesvd(D, mx, string, s):
     try:
         nd = getit(D, string, s)
@@ -854,64 +948,40 @@ def seesvd(D, mx, string, s):
 
     return k, c, nd
 
-def AECD(X, D, timeout=60):
+
+def count_everyone(X):
+    subs = set()
+
+    for l in range(1, len(X)+1):
+        for sidx in range(len(X) - l+1):
+            subs.add(X[sidx:sidx+l])
+
+    return len(subs)
+
+
+def ECD(X, D, timeout=60, budget=20):
     D.reset()
 
-    sols = {x: None for x in X}
-    nunsolved = len(sols)
     Q = F.log_softmax(th.ones(len(D)), -1)
 
-    while nunsolved > 0:
-        print(f'{len(sols) - nunsolved}/{len(sols)}')
-
-        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
-
-        trees = [s.balance() for s in sols.values() if s]
-        mx = sum(map(length, trees))
-        string = BREAK.join(map(str, trees))
-
-        ss = sorted(set(truly_largest_substring(string)), key=len, reverse=True)
-        kd = sorted([seesvd(D, mx, string, s) for s in ss], key=lambda x:x[0])
-
-        k, c, nd = kd[0]
-        if not nd in D:
-            print(f'adding {nd} #{c} with {k:.2f}')
-            D.add(nd)
-
-        for tree in trees:
-            replace(tree, nd.hiddentail, nd)
-
-        if nunsolved == 0:
-            break
-
-        Qmodel = dream(D, trees)
-        Q = Qmodel(tc(X[0])[None]).flatten().detach()
-        Q = F.log_softmax(Q, -1)
-
-    return sols
-
-
-def SECD(X, D, timeout=60, budget=0):
-    D.reset()
-
-    sols = {x: None for x in X}
-    nunsolved = len(sols)
-    Q = F.log_softmax(th.ones(len(D)), -1)
-
+    tosolve = count_everyone(X)
     idx = 0
-    while nunsolved > 0:
-        Q = F.log_softmax(th.ones(len(D)), -1)
-        print(f'{len(sols) - nunsolved}/{len(sols)}')
-        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout, budget=budget + 2 * idx)
+    sols = {}
+    solved = False
+    while not solved:
+        sols = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout, budget=budget + 2 * idx)
 
         trees = saturate(D, sols)
         idx += 1
 
-        if nunsolved == 0:
+        if X in sols:
             break
 
         Qmodel = dream(D, trees)
-        Q = Qmodel(tc(X[0])[None]).flatten().detach()
+
+        ntoks = 100
+        shift = max(randint(max(len(X) - ntoks, 1)), 0)
+        Q = Qmodel(tc(X)[shift:shift+ntoks][None]).flatten().detach()
         Q = F.log_softmax(Q, -1)
 
     return {x: tree for x, tree in zip(sols, trees)}
@@ -928,16 +998,19 @@ class RecognitionModel(nn.Module):
     def forward(self, x):
         return self.head(self.gpt(x).mean(1))
 
-
 def dream(D, soltrees=[]):
+    device = th.device('cuda' if th.cuda.is_available() else 'cpu')
+
     ntoks = 100
-    qmodel = RecognitionModel(len(D))
+    qmodel = RecognitionModel(len(D)).to(device)
     opt = th.optim.Adam(qmodel.parameters())
     paths, paths_terminal = makepaths(D, th.ones(len(D)))
 
     tbar = trange(100)
     for _ in tbar:
-        trees = [newtree(D, str, paths, paths_terminal, depth=7) for _ in range(10)] + soltrees
+        trees = [newtree(D, str, paths, paths_terminal, depth=10) for _ in range(4)]
+        for i in randint(len(soltrees), size=4):
+            trees.append(soltrees[i])
 
         Xy = [[tree()[:ntoks], alld(tree)] for tree in trees]
 
@@ -945,73 +1018,32 @@ def dream(D, soltrees=[]):
         Xy = [[(xy[0], D.index(d)) for d in xy[1]] for xy in Xy]
         Xy = reduce(lambda acc, xy: acc + xy, Xy, [])
 
-        X = [tc(xy[0]) for xy in Xy]
+        X = [tc(xy[0])[None].to(device) for xy in Xy]
 
-        q = th.vstack([qmodel(x[None]) for x in X])
-        y = tensor([xy[1] for xy in Xy])
+        q = th.vstack([qmodel(x) for x in X])
+        y = tensor([xy[1] for xy in Xy], device=device)
 
         opt.zero_grad()
         loss = F.cross_entropy(q, y)
         loss.backward()
         opt.step()
 
-        tbar.set_description(f'{loss=:.2f}')
+        tbar.set_description(f'{loss=:.2f} batchsize={len(X)}')
 
-    return qmodel
-
-def ECD(X, D, timeout=60):
-    D.reset()
-
-    sols = {x: None for x in X}
-    Q = th.ones(len(D))
-    Q = th.arange(1, len(D)+1).float()
-    Q = F.log_softmax(Q, -1)
-
-    while True:
-        # explore
-        sols, nunsolved = solve_enumeration(X, D, Q, sols, maxdepth=10, timeout=timeout)
-        # sols, nunsolved = solve_needle(X, D, Q, sols, maxdepth=10, ntries=ntries)
-
-        pprint(sols)
-        trees = [s.balance() for s in sols.values() if s]
-
-        # compress
-        trees = kcompress(D, trees)
-        print(D)
-
-        if nunsolved == 0:
-            return trees
-
-        evald = {tree(): tree for tree in trees}
-        sols = {x: None if x not in evald else evald[x] for x in X}
-
-        # dream
-        Qmodel = dream(D, trees)
-        Q = Qmodel(tc(X[0])[None]).flatten().detach()
-        Q = F.log_softmax(Q, -1)
-        print(Q)
+    return qmodel.to('cpu')
 
 if __name__ == '__main__':
     D = Deltas([
         Delta(add, int, [int, int], repr='+'),
         Delta(mul, str, [str, int], repr='*'),
         Delta(add, str, [str, str], repr='u'),
-        Delta('0', str, repr="'0'"),
-        Delta('1', str, repr="'1'"),
-        Delta(3, int),
         Delta(2, int),
+        Delta(3, int),
+        Delta('0', str),
+        Delta('1', str),
     ])
 
-    X = [
-        "1000",
-        "10001000",
-        "000000000000",
-        "100000000000",
-        "100010000000",
-        "100000001000",
-        "100010001000",
-    ]
+    X = "10001000100010001000"
+    Z = ECD(X, D, budget=16)
 
-    sols = SECD(X, D, budget=20)
-
-    sols
+    print(Z[X])

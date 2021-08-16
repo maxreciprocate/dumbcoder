@@ -3,18 +3,31 @@ from numpy import zeros, ones, empty, array
 from functools import partial, reduce
 from copy import deepcopy
 
-
 class Delta:
-    def __init__(self, head, type=None, tailtypes=None, tails=None, repr=None, hiddentail=None, unpacked=None):
+    def __init__(self, head, type=None, tailtypes=None, tails=None, repr=None, hiddentail=None, arrow=None, ishole=False, isarg=False):
         self.head = head
         self.tails = tails
         self.tailtypes = tailtypes
         self.type = type
+        self.ishole = ishole
+        self.isarg = isarg
+
+        if arrow:
+            self.arrow = arrow
+            self.type = arrow
+        else:
+            if tailtypes:
+                self.arrow = (tuple(tailtypes), type)
+            else:
+                self.arrow = type
+
         self.hiddentail = hiddentail
-        self.unpacked = unpacked
 
         if repr is None:
             repr = str(head)
+
+            if not self.ishole and not self.isarg and type == str:
+                repr = f"'{repr}'"
 
         self.repr = repr
         self.idx = 0
@@ -24,13 +37,11 @@ class Delta:
             return self.head
 
         if self.hiddentail:
-            # if len(self.tails) != len(self.tailtypes):
-            #     raise ValueError("this much tails are not enough")
-
             body = deepcopy(self.hiddentail)
 
             for tidx, tail in enumerate(self.tails):
-                replace(body, Delta(f'${tidx}', '-'), tail)
+                # arg in hiddentail should only match itself for replacement
+                body = replace_hidden(body, Delta(f'${tidx}', isarg=True, type=tail.type), tail)
 
             return body()
 
@@ -58,11 +69,20 @@ class Delta:
 
         return self
 
-    def __repr__(self):
-        # if self.hiddentail:
-        #     return f'({self.repr} {self.hiddentail})'
+    def __eq__(self, other):
+        if other is None:
+            return False
 
-        if self.tails is None:
+        if not isinstance(other, Delta):
+            return False
+
+        return isequal(self, other)
+
+    def __hash__(self):
+        return hash(repr(self))
+
+    def __repr__(self):
+        if self.tails is None or len(self.tails) == 0:
             return f'{self.repr}'
         else:
             tails = self.tails
@@ -96,14 +116,13 @@ def countholes(tree: Delta) -> int:
     if not tree:
         return 0
 
-    if not tree.type:
+    if tree.ishole:
         return 1
 
     if not tree.tails:
         return 0
 
     return sum(map(countholes, tree.tails))
-
 
 
 def getdepth(tree: Delta) -> int:
@@ -202,13 +221,11 @@ def tr(D, expr):
     return todelta(D, getast(expr))
 
 def isequal(n1, n2):
-    # wildcard matches everything
-    if not n1.type or not n2.type:
-        return True
+    if n1.ishole or n2.ishole:
+        return n1.type == n2.type
 
-    # or a wildcard of type $arg
-    if n1.type == '$' or n2.type == '$':
-        return True
+    if n1.isarg and n2.isarg:
+        return n1.type == n2.type
 
     if n1.head == n2.head:
         # 26 no kids
@@ -218,7 +235,14 @@ def isequal(n1, n2):
         if not n1.tails or not n2.tails:
             return False
 
-        return all(map(lambda ts: isequal(*ts), zip(n1.tails, n2.tails)))
+        if len(n1.tails) != len(n2.tails):
+            return False
+
+        for t1, t2 in zip(n1.tails, n2.tails):
+            if not isequal(t1, t2):
+                return False
+
+        return True
 
     return False
 
@@ -227,15 +251,17 @@ def extract_matches(tree, treeholed):
     given a healthy tree, find in it part covering holes in a given treeholed
     return pairs of holes and covered parts
     """
-    if not tree:
+    if not tree or not treeholed:
         return []
 
-    if treeholed.type == '$':
-        return [(treeholed.head, tree)]
+    if treeholed.ishole or treeholed.isarg:
+        return [(treeholed.head, deepcopy(tree))]
 
     out = []
     if not tree.tails:
         return []
+
+    # assert len(tree.tails) == len(treeholed.tails)
 
     for tail, holedtail in zip(tree.tails, treeholed.tails):
         out += extract_matches(tail, holedtail)
@@ -243,49 +269,62 @@ def extract_matches(tree, treeholed):
     return out
 
 
-def replace(tree, oldbranch, newbranch):
-    "replace given subtree with a new one"
-    if isequal(tree, oldbranch):
-        if not tree.tails:
-            return deepcopy(newbranch)
-
-        # in other words, if this is an abstraction
-        if newbranch.tailtypes and newbranch.hiddentail:
-            branch = deepcopy(newbranch)
-            args = {arg: tail for arg, tail in extract_matches(tree, oldbranch)}
-            if len(args) > 0:
-                branch.tails = list(args.values())
-            return branch
+def replace_hidden(tree, arg, tail):
+    if isequal(tree, arg):
+        return deepcopy(tail)
 
     if not tree.tails:
-        return
+        return tree
 
     qq = [tree]
     while len(qq) > 0:
         n = qq.pop(0)
+        if not n.tails: continue
 
-        if not n.tails:
-            continue
-
-        for idx in range(len(n.tails)):
-            if isequal(n.tails[idx], oldbranch):
-                branch = deepcopy(newbranch)
-                args = {arg: tail for arg, tail in extract_matches(n.tails[idx], oldbranch)}
-                if len(args) > 0:
-                    branch.tails = list(args.values())
-
-                n.tails[idx] = branch
-
+        for idx, nt in enumerate(n.tails):
+            if isequal(nt, arg):
+                n.tails[idx] = tail
+                break
             else:
-                qq.append(n.tails[idx])
+                qq.append(nt)
+
+    return tree
+
+def replace(tree, matchbranch, newbranch):
+    if isequal(tree, matchbranch):
+        branch = deepcopy(newbranch)
+
+        if not tree.tails:
+            return branch
+
+        args = {arg: tail for arg, tail in extract_matches(tree, matchbranch)}
+        if len(args) > 0:
+            branch.tails = list(args.values())
+
+        return branch
+
+    qq = [tree]
+    while len(qq) > 0:
+        n = qq.pop(0)
+        if not n.tails: continue
+
+        for i in range(len(n.tails)):
+            if isequal(n.tails[i], matchbranch):
+                branch = deepcopy(newbranch)
+                args = {arg: tail for arg, tail in extract_matches(n.tails[i], matchbranch)}
+                branch.tails = list(args.values())
+                n.tails[i] = branch
+            else:
+                qq.append(n.tails[i])
 
     return tree
 
 # d.type $ has property of wildcard matching
 # making it impossible to modify hiddentails
 def freeze(tree: Delta):
-    if tree.type == '$':
-        tree.type = '-'
+    if tree.ishole:
+        tree.ishole = False
+        tree.isarg = True
 
     if tree.hiddentail:
         freeze(tree.hiddentail)
@@ -294,14 +333,13 @@ def freeze(tree: Delta):
         for tail in tree.tails:
             freeze(tail)
 
-
 def normalize(tree):
     if tree.hiddentail:
         ht = normalize(deepcopy(tree.hiddentail))
 
         if tree.tails:
             for tidx, tail in enumerate(tree.tails):
-                replace(ht, Delta(f'${tidx}', '-'), normalize(tail))
+                replace_hidden(ht, Delta(f'${tidx}', isarg=True, type=tail.type), normalize(tail))
 
         return ht
 
@@ -317,11 +355,9 @@ def normalize(tree):
                 tails = n.tails[idx].tails
                 n.tails[idx] = normalize(deepcopy(n.tails[idx].hiddentail))
 
-                if not tails:
-                    continue
-
-                for tidx, tail in enumerate(tails):
-                    replace(n.tails[idx], Delta(f'${tidx}', '-'), normalize(tail))
+                if tails:
+                    for tidx, tail in enumerate(tails):
+                        n.tails[idx] = replace_hidden(n.tails[idx], Delta(f'${tidx}', isarg=True, type=tail.type), normalize(tail))
             else:
                 qq.append(normalize(n.tails[idx]))
 
@@ -341,17 +377,36 @@ def typize(tree: Delta):
         if not n.tails:
             continue
 
-        for idx, tp in enumerate(n.tailtypes):
-            # len(n.tails) < len(n.tailtypes) greedy match eg (* <>)
-            if idx >= len(n.tails) or not n.tails[idx].type:
-                tailtypes.append(tp)
-                n.tails[idx] = Delta('$' + str(z), '$')
+        for idx in range(len(n.tails)):
+            # is this a hole?
+            if n.tails[idx].ishole:
+                type = n.tails[idx].type
+                tailtypes.append(type)
+
+                # need to hole it for next tree replacement
+                n.tails[idx] = Delta(f'${z}', ishole=True, type=type)
                 z += 1
             else:
                 qq.append(n.tails[idx])
 
     return tailtypes
 
+def showoff_types(tree: Delta):
+    qq = [tree]
+    types = set()
+
+    while len(qq) > 0:
+        n = qq.pop(0)
+
+        types.add(n.type)
+
+        if not n.tails:
+            continue
+
+        for t in n.tails:
+            qq.append(t)
+
+    return types
 
 def comp(n1, n2):
     if isequal(n1, n2):
@@ -376,8 +431,9 @@ def showoff_kids(tree):
     for tail in tree.tails:
         yield from showoff_kids(tail)
 
+# also know as filter
 def flatten(xs):
-    return reduce(lambda acc, x: acc + x, xs, [])
+    return reduce(lambda acc, x: acc + x if x else acc, xs, [])
 
 def alld(tree):
     "enumerate all heads in tree"
